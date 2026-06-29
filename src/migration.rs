@@ -12,7 +12,14 @@ use crate::persistence::{data_dir, exe_dir, portable_mode};
 /// Marker written into the new data dir after a v7 migration attempt, so we
 /// never re-run migration (and never re-copy over data the user has since
 /// changed). See [`migrate_legacy_data_if_needed`].
-const MIGRATION_MARKER: &str = ".migration-v7-complete";
+///
+/// Bumped from `.migration-v7-complete`: the original migration copied
+/// `downloads/`/`playlists/` only when the target folder did NOT already exist,
+/// so an early partial migration could create the folder and then strand the
+/// remaining files there forever. The new marker forces that one-time, per-file
+/// **merge** (see `merge_dir_into`) to run once for users who already migrated,
+/// recovering any stranded playlists/downloads. Skip-if-exists keeps newer data.
+const MIGRATION_MARKER: &str = ".migration-v7-merge-complete";
 
 /// Names of the legacy exe-adjacent data that v7 migrates into the new data dir.
 const MIGRATED_FILES: [&str; 5] = [
@@ -65,11 +72,14 @@ fn run_migration(old_dir: &Path, new_dir: &Path) -> io::Result<()> {
     Ok(())
 }
 
-/// Copy the legacy data items from `old_dir` into `new_dir`, skipping any item
-/// whose target already exists (never overwrite newer data). Each item is staged
-/// into a temp sibling and verified before being renamed into place, so a
-/// half-copied `downloads/`/`playlists/` never lands at the final path (which
-/// would make future runs skip it). Platform-agnostic, unit-tested directly.
+/// Copy the legacy data items from `old_dir` into `new_dir`. Config files are
+/// copied only when the target is absent (never overwrite newer data). For the
+/// `downloads/`/`playlists/` folders: a fresh target is staged+renamed atomically
+/// (crash-safe), but an **existing** target is **merged per-file** — every legacy
+/// file whose target doesn't already exist is copied in. That recovers items
+/// stranded by an early partial migration (the folder existed, so the old
+/// whole-folder copy skipped it). Newer files in the target are always kept.
+/// Platform-agnostic, unit-tested directly.
 #[cfg_attr(not(windows), allow(dead_code))]
 fn copy_legacy_data(old_dir: &Path, new_dir: &Path) -> io::Result<()> {
     fs::create_dir_all(new_dir)?;
@@ -83,8 +93,38 @@ fn copy_legacy_data(old_dir: &Path, new_dir: &Path) -> io::Result<()> {
     for name in MIGRATED_DIRS {
         let src = old_dir.join(name);
         let dst = new_dir.join(name);
-        if src.is_dir() && !dst.exists() {
+        if !src.is_dir() {
+            continue;
+        }
+        if dst.exists() {
+            // Recovery path: fill in files the earlier migration left behind.
+            merge_dir_into(&src, &dst)?;
+        } else {
+            // Fresh target: stage + atomic rename, as before.
             copy_dir_into_place(&src, &dst)?;
+        }
+    }
+    Ok(())
+}
+
+/// Merge every file under `src` into `dst`, copying only files whose target does
+/// not already exist (never overwriting newer data) and recursing into
+/// subdirectories. Used when `dst` already exists, so a partial earlier migration
+/// that created the folder doesn't permanently strand the remaining files. Each
+/// file is staged + verified via [`copy_file_into_place`]. Symlinks/other types
+/// are skipped (none are expected in our data).
+#[cfg_attr(not(windows), allow(dead_code))]
+fn merge_dir_into(src: &Path, dst: &Path) -> io::Result<()> {
+    fs::create_dir_all(dst)?;
+    for entry in fs::read_dir(src)? {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        let from = entry.path();
+        let to = dst.join(entry.file_name());
+        if file_type.is_dir() {
+            merge_dir_into(&from, &to)?;
+        } else if file_type.is_file() && !to.exists() {
+            copy_file_into_place(&from, &to)?;
         }
     }
     Ok(())
@@ -210,6 +250,51 @@ mod tests {
         assert!(old.join("theme.json").is_file());
         assert!(old.join("downloads").join("song.mp3").is_file());
         // Marker written after a successful attempt.
+        assert!(new.join(MIGRATION_MARKER).is_file());
+
+        let _ = fs::remove_dir_all(&old);
+        let _ = fs::remove_dir_all(&new);
+    }
+
+    #[test]
+    fn migration_merges_stranded_files_into_existing_target() {
+        // Reproduces the v7.0 data-loss bug: the target playlists/downloads
+        // folders already exist (from an earlier partial migration), so the old
+        // whole-folder copy skipped them and stranded the rest. The merge must
+        // fill in the missing files without overwriting newer ones.
+        let old = unique_test_dir("migmerge-old");
+        let new = unique_test_dir("migmerge-new");
+
+        // Legacy (exe-adjacent) has three playlists and two downloads.
+        let old_pl = old.join("playlists");
+        fs::create_dir_all(&old_pl).unwrap();
+        fs::write(old_pl.join("keep.json"), b"OLD").unwrap();
+        fs::write(old_pl.join("stranded1.json"), b"s1").unwrap();
+        fs::write(old_pl.join("stranded2.json"), b"s2").unwrap();
+        let old_dl = old.join("downloads");
+        fs::create_dir_all(&old_dl).unwrap();
+        fs::write(old_dl.join("a.mp3"), b"aaa").unwrap();
+        fs::write(old_dl.join("b.mp3"), b"bbb").unwrap();
+
+        // Target already exists with ONE newer playlist + a same-named file.
+        let new_pl = new.join("playlists");
+        fs::create_dir_all(&new_pl).unwrap();
+        fs::write(new_pl.join("keep.json"), b"NEWER").unwrap(); // must NOT be clobbered
+        fs::write(new_pl.join("only-in-new.json"), b"n").unwrap();
+        fs::create_dir_all(new.join("downloads")).unwrap();
+
+        run_migration(&old, &new).expect("merge migration ok");
+
+        // Stranded files were merged in.
+        assert!(new_pl.join("stranded1.json").is_file());
+        assert!(new_pl.join("stranded2.json").is_file());
+        assert!(new.join("downloads").join("a.mp3").is_file());
+        assert!(new.join("downloads").join("b.mp3").is_file());
+        // The user's newer data is untouched.
+        assert_eq!(fs::read(new_pl.join("keep.json")).unwrap(), b"NEWER");
+        assert!(new_pl.join("only-in-new.json").is_file());
+        // Originals left in place; marker written.
+        assert!(old_pl.join("stranded1.json").is_file());
         assert!(new.join(MIGRATION_MARKER).is_file());
 
         let _ = fs::remove_dir_all(&old);
