@@ -1,0 +1,12 @@
+{
+  "yt-dlp.exe": {
+    "version": "2026.06.09",
+    "source": "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe",
+    "sha256": "3a48cb955d55c8821b60ccbdbbc6f61bc958f2f3d3b7ad5eaf3d83a543293a27"
+  },
+  "ffmpeg.exe": {
+    "version": "8.1.1-essentials_build-www.gyan.dev",
+    "source": "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip",
+    "sha256": "228d7a8556258de907fdb55f36850078ebc7680b84ec30d84ea02e99bec1d1eb"
+  }
+}
