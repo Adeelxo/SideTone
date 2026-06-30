@@ -2741,6 +2741,11 @@ fn run_app() -> AppResult<()> {
             }
         }
     });
+    // macOS Beta 0 is no-phone-home: never contact GitHub automatically on
+    // launch. Explicit user actions (Stream search, playlist import) may still
+    // use the network; the manual "open Releases page" path stays available on
+    // every platform. Windows behavior is unchanged.
+    #[cfg(not(target_os = "macos"))]
     check_for_update(app.as_weak());
 
     let progress_timer = start_progress_timer(&app, Arc::clone(&controller), Arc::clone(&queue));
@@ -3093,6 +3098,32 @@ fn repair_streaming_helpers(
     weak: slint::Weak<AppWindow>,
     controller: Arc<Mutex<PlayerController>>,
 ) {
+    // macOS Beta 0: yt-dlp/ffmpeg are bundled inside the .app, and the helper
+    // self-update/swap path is Windows-only (it downloads `yt-dlp.exe`). Don't
+    // attempt a Mac helper self-update yet — surface a clear message instead of
+    // running the Windows-shaped repair.
+    #[cfg(target_os = "macos")]
+    {
+        let _ = &controller;
+        if let Some(app) = weak.upgrade() {
+            let msg = "Repair isn't available in the macOS beta yet — yt-dlp and ffmpeg are bundled inside the app. Reinstall the latest beta to refresh them.";
+            app.set_streaming_helper_label(SharedString::from(msg));
+            app.set_streaming_helper_action(SharedString::from("Check"));
+            app.set_status_text(SharedString::from(msg));
+            app.set_status_flash(true);
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    repair_streaming_helpers_impl(weak, controller);
+}
+
+/// Windows/non-macOS repair implementation: download the latest official
+/// yt-dlp, validate it, and swap it in. Gated off macOS (see the dispatcher).
+#[cfg(not(target_os = "macos"))]
+fn repair_streaming_helpers_impl(
+    weak: slint::Weak<AppWindow>,
+    controller: Arc<Mutex<PlayerController>>,
+) {
     // Never start a second repair while one is in flight. This same flag also
     // blocks every yt-dlp/ffmpeg spawn for the duration (see streaming_helpers),
     // so nothing can re-lock yt-dlp.exe while we swap it.
@@ -3164,6 +3195,8 @@ fn repair_streaming_helpers(
 /// Stops the controller first: `process::exit` skips destructors, so without
 /// this the active stream's `yt-dlp`/`ffmpeg` children would be orphaned (their
 /// cleanup lives in `YoutubeStreamSource::drop`, run via `controller.stop()`).
+/// Only reachable from the non-macOS repair path (macOS Beta 0 has no Repair).
+#[cfg(not(target_os = "macos"))]
 fn restart_app(controller: Arc<Mutex<PlayerController>>) {
     // Recover from a poisoned mutex (a thread panicked while holding the lock)
     // so cleanup still runs — otherwise process::exit would orphan the children.
@@ -5392,11 +5425,22 @@ fn bind_app_callbacks(
         move || match favorites_dir() {
             Ok(dir) => {
                 let _ = fs::create_dir_all(&dir);
+                // Open the folder in the platform file manager. Only report
+                // success when a command actually spawned, so we never claim to
+                // have opened a window that never appeared (the macOS path used
+                // to show success unconditionally while doing nothing).
                 #[cfg(windows)]
-                {
-                    let _ = hidden_command("explorer").arg(&dir).spawn();
+                let opened = hidden_command("explorer").arg(&dir).spawn().is_ok();
+                #[cfg(target_os = "macos")]
+                let opened = std::process::Command::new("open").arg(&dir).spawn().is_ok();
+                #[cfg(all(not(windows), not(target_os = "macos")))]
+                let opened = std::process::Command::new("xdg-open").arg(&dir).spawn().is_ok();
+
+                if opened {
+                    set_status(&weak, "Opened downloads folder.");
+                } else {
+                    set_status(&weak, "Could not open downloads folder.");
                 }
-                set_status(&weak, "Opened downloads folder.");
             }
             Err(_) => set_status(&weak, "Could not open downloads folder."),
         }
@@ -5823,6 +5867,9 @@ fn set_import_active_async(weak: &slint::Weak<AppWindow>, active: bool) {
 // also never auto-download or auto-run an installer.
 
 /// Off-thread startup check; flips the banner on only if a newer build exists.
+/// Not compiled on macOS: the Beta 0 track is no-phone-home (see the gated call
+/// site in `bind_app_callbacks`).
+#[cfg(not(target_os = "macos"))]
 fn check_for_update(weak: slint::Weak<AppWindow>) {
     thread::spawn(move || {
         let Some((tag, remote)) = fetch_latest_release() else {

@@ -4,3 +4,6 @@ dist/
 *.pdb
 *.log
 *.tmp
+# Bundled macOS helper binaries (yt-dlp/ffmpeg) are not committed — fetched at
+# package time, same as the Windows *.exe helpers above.
+assets/deps/macos/

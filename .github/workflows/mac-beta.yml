@@ -1,0 +1,63 @@
+# macOS Beta 0 build check.
+#
+# Compile-verifies SideTone for Apple Silicon and Intel on native runners. This
+# is the real check that the macOS cfg paths build (the Windows host cannot
+# cross-compile cpal/coreaudio-sys). It is build-only: no helper bundling, no
+# .app packaging, no signing, no release upload — those are handled separately
+# by scripts/make-app.sh once helper binaries are in place.
+#
+# Does not run on `main` (Windows v7 is unaffected).
+name: mac-beta-build
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [mac]
+    paths:
+      - "src/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "build.rs"
+      - ".github/workflows/mac-beta.yml"
+  pull_request:
+    branches: [mac]
+
+concurrency:
+  group: mac-beta-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: build ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: arm64
+            runner: macos-14          # Apple Silicon
+            target: aarch64-apple-darwin
+          - arch: x86_64
+            runner: macos-15-intel    # Intel — macos-13 was retired Dec 2025;
+                                      # macos-15-intel is the last Intel image
+                                      # (available through ~Aug 2027). Re-verify
+                                      # before relying on x86_64 long-term.
+            target: x86_64-apple-darwin
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain (${{ matrix.target }})
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build (debug, compile check)
+        run: cargo build --target ${{ matrix.target }}
+
+      - name: Unit tests (host arch)
+        run: cargo test
