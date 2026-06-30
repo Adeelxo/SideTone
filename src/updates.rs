@@ -1,5 +1,8 @@
 use std::time::Duration;
 
+// Only used by the Windows `explorer` branch in `open_validated_url`; gating the
+// import keeps non-Windows builds warning-clean.
+#[cfg(windows)]
 use crate::streaming_helpers::hidden_command;
 
 const RELEASES_API: &str = "https://api.github.com/repos/Adeelxo/SideTone/releases/latest";
